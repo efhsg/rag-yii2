@@ -1,12 +1,26 @@
 <?php
 
+$local = [];
+$localFile = __DIR__ . '/params-local.php';
+
+if (is_file($localFile)) {
+    $local = require $localFile;
+}
+
 return [
     'adminEmail' => 'admin@example.com',
     'senderEmail' => 'noreply@example.com',
     'senderName' => 'Example.com mailer',
 
     'mistral' => [
-        'api_key' => getenv('MISTRAL_API_KEY') ?: '',
+        // volgorde:
+        // 1) params-local.php
+        // 2) environment variable
+        // 3) leeg (foutmelding in UI/CLI)
+        'api_key' => $local['mistral']['api_key']
+            ?? getenv('MISTRAL_API_KEY')
+            ?: '',
+
         'base_url' => 'https://api.mistral.ai',
         'timeout' => 30,
         'embedding_model' => 'mistral-embed',
