@@ -2,7 +2,9 @@
 
 namespace app\commands;
 
+use app\components\rag\ChunkStrategyInterface;
 use app\components\rag\MistralClient;
+use app\components\rag\SemanticChunkStrategy;
 use app\components\rag\WordChunkStrategy;
 use app\models\Chunk;
 use app\models\Document;
@@ -96,10 +98,11 @@ class RagController extends Controller
      * Delete all chunks and re-chunk all documents using a chunk strategy.
      *
      * Usage:
-     * php yii rag/build-chunks
+     * php yii rag/build-chunks word
+     * php yii rag/build-chunks semantic
      * @throws Exception
      */
-    public function actionBuildChunks(): int
+    public function actionBuildChunks(string $mode = 'word'): int
     {
         $this->stdout("Deleting all chunks...\n");
         $deleted = Chunk::deleteAll();
@@ -111,7 +114,11 @@ class RagController extends Controller
             return ExitCode::OK;
         }
 
-        $strategy = new WordChunkStrategy(250, 50);
+        $strategy = $this->resolveChunkStrategy($mode);
+        if ($strategy === null) {
+            $this->stdout("Unknown mode '$mode'. Use 'word' or 'semantic'.\n");
+            return ExitCode::OK;
+        }
 
         $this->stdout("Chunking " . count($documents) . " documents...\n");
 
@@ -149,11 +156,25 @@ class RagController extends Controller
         return ExitCode::OK;
     }
 
+    private function resolveChunkStrategy(string $mode): ?ChunkStrategyInterface
+    {
+        $mode = strtolower($mode);
+        if ($mode === 'semantic') {
+            return new SemanticChunkStrategy(250, 50);
+        }
+
+        if ($mode === 'word') {
+            return new WordChunkStrategy(250, 50);
+        }
+
+        return null;
+    }
+
     /**
      * @throws NotInstantiableException
      * @throws InvalidConfigException
      */
-    public function actionBuildEmbeddings(int $limit = 200): int
+    public function actionBuildEmbeddings(int $limit = 500): int
     {
         // Haal MistralClient uit de DI-container (singleton)
         /** @var MistralClient $mistral */
