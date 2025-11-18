@@ -2,6 +2,7 @@
 
 
 use app\components\rag\MistralClient;
+use app\components\rag\RagService;
 
 $params = require __DIR__ . '/params.php';
 $db = require __DIR__ . '/db.php';
@@ -34,6 +35,11 @@ $config = [
         'singletons' => [
             MistralClient::class => function () use ($params) {
                 return new MistralClient($params['mistral']);
+            },
+            RagService::class => static function () {
+                /** @var MistralClient $mistral */
+                $mistral = Yii::$container->get(MistralClient::class);
+                return new RagService($mistral);
             },
         ],
     ],

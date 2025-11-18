@@ -3,22 +3,22 @@
 namespace app\commands;
 
 use app\components\rag\ChunkStrategyInterface;
-use app\components\rag\MistralClient;
+use app\components\rag\RagService;
 use app\components\rag\SemanticChunkStrategy;
 use app\components\rag\WordChunkStrategy;
 use app\models\Chunk;
 use app\models\Document;
+use Exception;
 use FilesystemIterator;
 use GuzzleHttp\Exception\GuzzleException;
 use RecursiveDirectoryIterator;
 use RecursiveIteratorIterator;
 use SplFileInfo;
-use Throwable;
 use Yii;
 use yii\base\InvalidConfigException;
 use yii\console\Controller;
 use yii\console\ExitCode;
-use yii\db\Exception;
+use yii\db\Exception as DbException;
 use yii\di\NotInstantiableException;
 
 class RagController extends Controller
@@ -29,7 +29,7 @@ class RagController extends Controller
      * Usage:
      * php yii rag/import-wiki @app/runtime/wiki
      * php yii rag/import-wiki C:\www\cc\rag-yii2\runtime\wiki
-     * @throws Exception
+     * @throws DbException
      */
     public function actionImportWiki(string $dirAlias): int
     {
@@ -100,7 +100,7 @@ class RagController extends Controller
      * Usage:
      * php yii rag/build-chunks word
      * php yii rag/build-chunks semantic
-     * @throws Exception
+     * @throws DbException
      */
     public function actionBuildChunks(string $mode = 'word'): int
     {
@@ -176,53 +176,16 @@ class RagController extends Controller
      */
     public function actionBuildEmbeddings(int $limit = 500): int
     {
-        // Haal MistralClient uit de DI-container (singleton)
-        /** @var MistralClient $mistral */
-        $mistral = Yii::$container->get(MistralClient::class);
+        /** @var RagService $ragService */
+        $ragService = Yii::$container->get(RagService::class);
 
-        $query = Chunk::find()
-            ->where([
-                'or',
-                ['embedding_json' => '[]'],
-                ['embedding_json' => ''],
-                ['embedding_json' => null],
-            ])
-            ->orderBy(['id' => SORT_ASC])
-            ->limit($limit);
+        $this->stdout("Processing chunks without embeddings...\n");
 
-        /** @var Chunk[] $chunks */
-        $chunks = $query->all();
+        $processed = $ragService->buildEmbeddings($limit);
 
-        if (empty($chunks)) {
+        if ($processed === 0) {
             $this->stdout("No chunks without embeddings found.\n");
             return ExitCode::OK;
-        }
-
-        $this->stdout("Generating embeddings for " . count($chunks) . " chunks...\n");
-
-        $processed = 0;
-
-        foreach ($chunks as $chunk) {
-            $text = $chunk->text;
-
-            try {
-                $vector = $mistral->generateEmbedding($text);
-                $normalized = $this->normalizeVector($vector);
-
-                $chunk->embedding_json = json_encode($normalized);
-
-                // alleen embedding_json opslaan, geen validation nodig
-                if (!$chunk->save(false, ['embedding_json'])) {
-                    $this->stderr("Failed to save embedding for chunk #$chunk->id\n");
-                    $this->stderr(print_r($chunk->getErrors(), true));
-                    continue;
-                }
-
-                $processed++;
-                $this->stdout("Chunk #$chunk->id: embedding saved.\n");
-            } catch (Throwable $e) {
-                $this->stderr("Error embedding chunk #$chunk->id: {$e->getMessage()}\n");
-            }
         }
 
         $this->stdout("Done. Embeddings generated for $processed chunks.\n");
@@ -234,153 +197,44 @@ class RagController extends Controller
      * @throws NotInstantiableException
      * @throws GuzzleException
      * @throws InvalidConfigException
+     * @throws Exception
      */
     public function actionAsk(string $question, int $topK = 5): int
     {
-        /** @var MistralClient $mistral */
-        $mistral = Yii::$container->get(MistralClient::class);
+        /** @var RagService $ragService */
+        $ragService = Yii::$container->get(RagService::class);
 
-        $this->stdout("Embedding question...\n");
+        $this->stdout("Embedding question and retrieving context...\n");
 
-        $questionEmbedding = $mistral->generateEmbedding($question);
-        $questionEmbedding = $this->normalizeVector($questionEmbedding);
+        $result = $ragService->answerQuestion($question, $topK);
 
-        $this->stdout("Loading chunk embeddings...\n");
-
-        /** @var Chunk[] $chunks */
-        $chunks = Chunk::find()
-            ->where(['not', ['embedding_json' => null]])
-            ->andWhere(['!=', 'embedding_json', ''])
-            ->andWhere(['!=', 'embedding_json', '[]'])
-            ->all();
-
-        if (!$chunks) {
-            $this->stdout("No chunks with embeddings found. Run rag/build-chunks and rag/build-embeddings first.\n");
+        if ($result['error'] !== null) {
+            $this->stdout($result['error'] . PHP_EOL);
             return ExitCode::OK;
         }
 
-        $scoredChunks = [];
-
-        foreach ($chunks as $chunk) {
-            $vector = json_decode($chunk->embedding_json, true);
-
-            if (!is_array($vector) || $vector === []) {
-                continue;
-            }
-
-            $score = $this->cosineSimilarity($questionEmbedding, $vector);
-
-            $scoredChunks[] = [
-                'chunk' => $chunk,
-                'score' => $score,
-            ];
-        }
-
-        if (!$scoredChunks) {
-            $this->stdout("No valid embeddings found to score against.\n");
-            return ExitCode::OK;
-        }
-
-        usort(
-            $scoredChunks,
-            static function (array $a, array $b): int {
-                return $b['score'] <=> $a['score'];
-            }
-        );
-
-        $topK = max(1, $topK);
-        $topChunks = array_slice($scoredChunks, 0, $topK);
-
-        $this->stdout("Using top $topK chunks as context.\n");
-
-        $context = [];
-        $contextForPrint = [];
-
-        foreach ($topChunks as $item) {
-            /** @var Chunk $chunk */
-            $chunk = $item['chunk'];
-            $score = $item['score'];
-
-            /** @var Document|null $document */
-            $document = $chunk->document;
-            $title = $document ? $document->title : 'Unknown document';
-            $sourceId = $document ? $document->source_id : 'n/a';
-
-            $context[] = [
-                'content' => $chunk->text,
-            ];
-
-            $contextForPrint[] = [
-                'title' => $title,
-                'source_id' => $sourceId,
-                'score' => $score,
-                'preview' => mb_substr($chunk->text, 0, 160),
-            ];
-        }
-
-        $this->stdout("Calling Mistral chat API...\n");
-
-        $answer = $mistral->generateChatResponse($question, $context);
+        $answer = $result['answer'];
+        $contextItems = $result['contextItems'];
 
         $this->stdout(PHP_EOL . "=== ANSWER ===" . PHP_EOL);
         $this->stdout($answer . PHP_EOL . PHP_EOL);
 
         $this->stdout("=== CONTEXT USED ===" . PHP_EOL);
 
-        foreach ($contextForPrint as $i => $ctx) {
-            $rank = $i + 1;
+        foreach ($contextItems as $item) {
+            $rank = $item['rank'];
+            $score = number_format($item['score'], 4);
+            $title = $item['title'];
+            $sourceId = $item['sourceId'];
+            $preview = str_replace(PHP_EOL, ' ', $item['preview']);
+
             $this->stdout(
-                "#$rank [score " . number_format($ctx['score'], 4) . "] " .
-                "{$ctx['title']} ({$ctx['source_id']})" . PHP_EOL .
-                "    " . str_replace(PHP_EOL, ' ', $ctx['preview']) . "..." . PHP_EOL
+                "#$rank [score $score] $title ($sourceId)" . PHP_EOL .
+                "    $preview..." . PHP_EOL
             );
         }
 
         return ExitCode::OK;
-    }
-
-    private function cosineSimilarity(array $a, array $b): float
-    {
-        $lenA = count($a);
-        $lenB = count($b);
-
-        if ($lenA === 0 || $lenB === 0 || $lenA !== $lenB) {
-            return 0.0;
-        }
-
-        $dot = 0.0;
-
-        for ($i = 0; $i < $lenA; $i++) {
-            $dot += $a[$i] * $b[$i];
-        }
-
-        return $dot;
-    }
-
-
-    /**
-     * Normalize a vector to unit length (for cosine similarity later).
-     *
-     * @param float[] $vector
-     * @return float[]
-     */
-    private function normalizeVector(array $vector): array
-    {
-        $sumSq = 0.0;
-        foreach ($vector as $v) {
-            $sumSq += $v * $v;
-        }
-
-        if ($sumSq <= 0.0) {
-            return $vector;
-        }
-
-        $norm = sqrt($sumSq);
-        foreach ($vector as $i => $v) {
-            $vector[$i] = $v / $norm;
-        }
-
-        return $vector;
     }
 
     /**
